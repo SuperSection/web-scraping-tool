@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -11,8 +12,8 @@ from seleniumbase import Driver
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-import time
 from urllib.parse import urljoin, urlparse, quote
 from output_writer import save_to_json, save_to_csv
 
@@ -32,10 +33,10 @@ def get_clutch_search_results(search_query, headless=True):
     Performs a search on clutch.co and gets top 2 list of companies pages.
 
     Args:
-        search_query (str): The search term to use on clutch.co.
+        search_query (str): The query to pass on https://clutch.co/search.
 
     Returns:
-        list: List of HTML content from top 2 list of companies pages.
+        list: List of HTML contents of company profile pages from https://clutch.co/profile.
     """
     BASE_URL = "https://clutch.co"
     search_url = f"{BASE_URL}/search?q={quote(search_query)}"
@@ -62,8 +63,8 @@ def get_clutch_search_results(search_query, headless=True):
         )
 
         # Find top 2 company list links
-        company_links = driver.find_elements(By.CSS_SELECTOR, "#companies-results a.companies_item")
-        target_urls = [urljoin(BASE_URL, link.get_attribute("href")) for link in company_links[:2]]
+        company_list_links = driver.find_elements(By.CSS_SELECTOR, "#companies-results a.companies_item")
+        target_urls = [urljoin(BASE_URL, link.get_attribute("href")) for link in company_list_links[:2]]
 
         for i, target_url in enumerate(target_urls):
             try:
@@ -73,16 +74,30 @@ def get_clutch_search_results(search_query, headless=True):
                 driver.uc_open_with_reconnect(target_url, 3)
                 driver.uc_gui_click_captcha()
 
-                # Wait for company listings to load
-                WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "section#providers__section, ul#providers__list"))
-                )
+                try:
+                    # Wait for company listings to load
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "section#providers__section, ul#providers__list"))
+                    )
+                except:
+                    print(f"No Company listings found on {target_url}, skipping this page...")
+                    continue
 
-                # Scroll to load more content
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
-                time.sleep(2)
+                company_profile_link_elements = driver.find_elements(By.CSS_SELECTOR , "a.provider__title-link")
+                if not company_profile_link_elements:
+                    print(f"No company profiles found on {target_url}")
+                    continue
 
-                html_pages.append(driver.page_source)
+                company_profile_links = [urljoin(BASE_URL, link.get_attribute("href")) for link in company_profile_link_elements]
+
+                # Fetch profile pages in parallel using requests
+                with ThreadPoolExecutor() as executor:
+                    profile_pages = list(executor.map(fetch_profile_page, company_profile_links))
+
+                # Add valid pages to html_pages
+                for page_content in profile_pages:
+                    if page_content:
+                        html_pages.append(page_content)
 
             except Exception as e:
                 print(f"Error processing company list {i+1}: {e}")
@@ -96,6 +111,20 @@ def get_clutch_search_results(search_query, headless=True):
     finally:
         if 'driver' in locals() and driver:
             driver.quit()
+
+
+def fetch_profile_page(profile_link):
+    """Fetch a single profile page using requests"""
+    try:
+        response = requests.get(
+            profile_link,
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        )
+        return response.text
+    except Exception as e:
+        print(f"Error fetching company profile of {profile_link}: {e}")
+        return None
 
 
 def parse_clutch_results(html_pages):
@@ -115,33 +144,78 @@ def parse_clutch_results(html_pages):
         if not html_content:
             continue
 
-        soup = BeautifulSoup(html_content, 'html.parser')
+        company = BeautifulSoup(html_content, 'html.parser')
+        print("Company:", company)
 
-        # Try multiple selectors for company listings
-        company_listings = (soup.find_all('li', class_='provider-list-item') or
-                          soup.find_all('div', class_='provider-row', attrs={'data-type': "Directory"}))
+        try:
+            # Extract Company Name
+            name_element = company.find('h1', class_='profile-header__title', attrs={'itemprop': "name"})
 
-        print(f"[📄] Found {len(company_listings)} companies on page {i+1}")
+            if name_element:
+                company_name = name_element.get_text(strip=True)
+                # Normalize Unicode characters
+                company_name = unicodedata.normalize('NFKC', company_name)
+            else:
+                company_name = None
 
-        for company in company_listings:
-            # company = soup # Treat the whole soup as the 'company' for extraction
-            try:
-                # Extract Company Name
-                name_element = company.find('h3', class_='provider__title')
-                company_name = name_element.get_text(strip=True) if name_element else None
+            # Get website link from redirect URL
+            website_link_element = company.find('a', class_='website-link__item', href=True)
+            redirect_url = website_link_element.get('href') if website_link_element else None
 
-                # Get website link from redirect URL
-                website_link_element = company.find('a', attrs={'data-link_text': "Visit Website Button"}, class_='website-link__item', href=True)
-                redirect_url = website_link_element.get('href') if website_link_element else None
+            details_section = company.find('ul', class_='profile-summary__details')
+            location = None
+            founded_year = None
 
-                all_companies.append({
-                    'Company Name': company_name,
-                    'Website URL': None
-                })
-                redirect_urls.append(redirect_url)
-            except Exception as e:
-                print(f"Error parsing company data: {e}")
-                continue
+            if details_section:
+                detail_items = details_section.find_all('li', class_='profile-summary__detail')
+
+                for item in detail_items:
+                    label = item.find('span', class_='profile-summary__detail-label')
+                    value = item.find('span', class_='profile-summary__detail-title')
+
+                    if not label or not value:
+                        continue
+
+                    label_text = label.get_text(strip=True).lower()
+                    value_text = value.get_text(strip=True)
+
+                    if 'location' in label_text:
+                        location = value_text
+                    elif 'founded' in label_text:
+                        # Extract the year from something like "Founded 1996"
+                        match = re.search(r'\b(19|20)\d{2}\b', value_text)
+                        founded_year = match.group(0) if match else value_text
+
+            services = []
+
+            # Locate the service pie chart section
+            services_list = company.find_all('li', class_='chart-legend--item')
+
+            for service_item in services_list:
+                try:
+                    service_name_tag = service_item.find('h3')
+                    service_name = service_name_tag.get_text(strip=True) if service_name_tag else None
+
+                    percentage_tag = service_item.find('span')
+                    percentage = percentage_tag.get_text(strip=True) if percentage_tag else None
+
+                    if service_name and percentage:
+                        services.append(f"{service_name} ({percentage})")
+                except Exception as e:
+                    print(f"[⚠️] Error extracting service: {e}")
+                    continue
+
+            all_companies.append({
+                'Company Name': company_name,
+                'Website URL': None,
+                'Location': location,
+                'Services': services,
+                'Founded Year': founded_year
+            })
+            redirect_urls.append(redirect_url)
+        except Exception as e:
+            print(f"Error parsing company data: {e}")
+            continue
 
     # Resolve URLs in parallel
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -176,7 +250,7 @@ def get_final_website_url(redirect_url):
         response = requests.get(
             redirect_url,
             allow_redirects=True,
-            timeout=10,
+            timeout=5,
             verify=False,  # Skip SSL verification
             headers=request_headers
         )
@@ -227,7 +301,7 @@ def main():
 
     elif args.query:
         print(f"🔍 Searching for: '{args.query}'")
-        html_pages = get_clutch_search_results(args.query, headless=True)
+        html_pages = get_clutch_search_results(args.query, headless=False)
 
         if html_pages:
             company_data = parse_clutch_results(html_pages)
@@ -247,6 +321,12 @@ def main():
         return
 
     if company_data:
+        # Convert list of services to a joined string for CSV
+        if args.output == 'csv':
+            for company in company_data:
+                if 'Services' in company and isinstance(company['Services'], list):
+                    company['Services'] = '; '.join(company['Services'])  # Convert list to string for CSV
+
         if args.output == 'json':
             save_to_json(company_data)
         else:
